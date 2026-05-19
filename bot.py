@@ -13,17 +13,17 @@ from apscheduler.triggers.interval import IntervalTrigger
 # ==================== НАСТРОЙКИ ИЗ ПЕРЕМЕННЫХ ====================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-ADMIN_GROUP_ID = os.getenv("ADMIN_GROUP_ID")  # ID админской группы
+ADMIN_GROUP_ID = os.getenv("ADMIN_GROUP_ID")
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow")
-
-# Проверка наличия обязательных переменных
-if not BOT_TOKEN:
-    raise ValueError("❌ BOT_TOKEN не найден! Добавь переменную в Railway")
-if not ADMIN_ID:
-    raise ValueError("❌ ADMIN_ID не найден! Добавь переменную в Railway")
 
 # Преобразуем ADMIN_GROUP_ID в int если он задан
 ADMIN_GROUP_ID = int(ADMIN_GROUP_ID) if ADMIN_GROUP_ID else None
+
+# Проверка наличия обязательных переменных
+if not BOT_TOKEN:
+    raise ValueError("❌ BOT_TOKEN не найден!")
+if not ADMIN_ID:
+    raise ValueError("❌ ADMIN_ID не найден!")
 
 # Настройка логирования
 logging.basicConfig(
@@ -51,7 +51,7 @@ class Database:
     def init_tables(self):
         cursor = self.conn.cursor()
         
-        # Таблица групп/каналов для рассылок
+        # Таблица групп для рассылок
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS target_groups (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -63,7 +63,7 @@ class Database:
             )
         ''')
         
-        # Таблица рассылок (с привязкой к группе)
+        # Таблица рассылок
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS broadcasts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -84,7 +84,7 @@ class Database:
             )
         ''')
         
-        # Таблица пользователей (подписчики на уведомления)
+        # Таблица пользователей
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
@@ -309,7 +309,7 @@ class Database:
 
 db = Database()
 
-# ==================== ФУНКЦИЯ ПРОВЕРКИ АДМИНА ====================
+# ==================== ФУНКЦИИ ПРОВЕРКИ ====================
 def is_admin(user_id):
     return user_id == ADMIN_ID
 
@@ -318,7 +318,7 @@ def is_admin_chat(chat_id):
     return ADMIN_GROUP_ID and chat_id == ADMIN_GROUP_ID
 
 async def send_to_admin(text, parse_mode="Markdown"):
-    """Отправляет сообщение в админскую группу (если она настроена)"""
+    """Отправляет сообщение в админскую группу"""
     if ADMIN_GROUP_ID:
         try:
             await bot.send_message(ADMIN_GROUP_ID, text, parse_mode=parse_mode)
@@ -327,22 +327,14 @@ async def send_to_admin(text, parse_mode="Markdown"):
 
 # ==================== ОТПРАВКА РАССЫЛКИ ====================
 async def send_broadcast(broadcast_id: int):
-    """Отправляет рассылку в привязанную группу"""
-    logger.info(f"🚀 Запуск рассылки #{broadcast_id} в {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info(f"🚀 Запуск рассылки #{broadcast_id}")
     
     broadcast = db.get_broadcast(broadcast_id)
-    if not broadcast:
-        logger.warning(f"❌ Рассылка #{broadcast_id} не найдена")
-        return
-    
-    if not broadcast['is_active']:
-        logger.info(f"⏸ Рассылка #{broadcast_id} отключена")
+    if not broadcast or not broadcast['is_active']:
         return
     
     group = db.get_target_group(broadcast['group_id'])
     if not group or not group['is_active']:
-        logger.warning(f"❌ Группа для рассылки #{broadcast_id} не найдена или отключена")
-        await send_to_admin(f"❌ **Ошибка рассылки**\n\nРассылка: {broadcast['name']}\nГруппа не найдена или отключена")
         return
     
     chat_id = int(group['chat_id'])
@@ -350,173 +342,103 @@ async def send_broadcast(broadcast_id: int):
     try:
         if broadcast['content_type'] == 'text' and broadcast['text']:
             await bot.send_message(chat_id, broadcast['text'])
-            logger.info(f"✅ Текст отправлен в {group['name']} ({chat_id})")
-        
         elif broadcast['content_type'] == 'photo' and broadcast['photo_file_id']:
             await bot.send_photo(chat_id, broadcast['photo_file_id'], 
                                  caption=broadcast['text'] or "")
-            logger.info(f"✅ Фото отправлено в {group['name']} ({chat_id})")
         
         db.update_last_sent(broadcast_id)
         db.log_broadcast(broadcast_id, "success")
-        logger.info(f"✅ Рассылка #{broadcast_id} ('{broadcast['name']}') успешно отправлена в {group['name']}")
+        logger.info(f"✅ Рассылка #{broadcast_id} отправлена в {group['name']}")
         
-        # Уведомление в админскую группу
-        await send_to_admin(
-            f"✅ **Рассылка выполнена**\n\n"
-            f"📢 Название: {broadcast['name']}\n"
-            f"📬 Группа: {group['name']}\n"
-            f"🕐 Время: {datetime.now().strftime('%H:%M:%S')}"
-        )
+        await send_to_admin(f"✅ **{broadcast['name']}**\n➡️ Отправлено в {group['name']}")
         
     except Exception as e:
-        error_msg = str(e)
-        logger.error(f"❌ Ошибка отправки рассылки #{broadcast_id}: {error_msg}")
-        db.log_broadcast(broadcast_id, "error", error_msg)
-        
-        await send_to_admin(
-            f"❌ **Ошибка рассылки**\n\n"
-            f"📢 Название: {broadcast['name']}\n"
-            f"📬 Группа: {group['name']}\n"
-            f"❌ Ошибка: {error_msg[:200]}"
-        )
-        
-        if "chat not found" in error_msg.lower():
-            logger.error(f"❌ Группа {chat_id} не найдена!")
-        elif "bot is not a member" in error_msg.lower():
-            logger.error(f"❌ Бот не является участником группы {chat_id}!")
+        logger.error(f"❌ Ошибка: {e}")
+        db.log_broadcast(broadcast_id, "error", str(e))
+        await send_to_admin(f"❌ **{broadcast['name']}**\n➡️ {group['name']}\nОшибка: {str(e)[:100]}")
 
-# ==================== ЗАГРУЗКА РАССЫЛОК ПРИ СТАРТЕ ====================
+# ==================== ЗАГРУЗКА РАССЫЛОК ====================
 async def load_all_broadcasts():
-    """Загружает все активные рассылки из БД в планировщик"""
     broadcasts = db.get_all_broadcasts()
-    logger.info(f"📋 Загрузка {len(broadcasts)} рассылок из БД")
+    logger.info(f"📋 Загрузка {len(broadcasts)} рассылок")
     
     for b in broadcasts:
-        job_id = f"broadcast_{b['id']}"
-        
-        if scheduler.get_job(job_id):
-            scheduler.remove_job(job_id)
-        
         if not b['is_active']:
-            logger.info(f"⏸ Рассылка #{b['id']} ('{b['name']}') неактивна")
             continue
+        
+        job_id = f"broadcast_{b['id']}"
         
         if b['schedule_type'] == 'fixed' and b['hour'] is not None:
             trigger = CronTrigger(hour=b['hour'], minute=b['minute'], timezone=TIMEZONE)
             scheduler.add_job(send_broadcast, trigger, args=[b['id']], id=job_id)
-            logger.info(f"📅 Загружена fixed-рассылка #{b['id']}: '{b['name']}' в {b['hour']:02d}:{b['minute']:02d}")
+            logger.info(f"📅 Загружена: {b['name']} в {b['hour']:02d}:{b['minute']:02d}")
         
         elif b['schedule_type'] == 'interval' and b['interval_minutes']:
             trigger = IntervalTrigger(minutes=b['interval_minutes'])
             scheduler.add_job(send_broadcast, trigger, args=[b['id']], id=job_id)
-            mins = b['interval_minutes']
-            hours = mins // 60
-            minutes = mins % 60
-            if hours > 0:
-                schedule_text = f"каждые {hours}ч {minutes}мин" if minutes > 0 else f"каждые {hours}ч"
-            else:
-                schedule_text = f"каждые {minutes}мин"
-            logger.info(f"⏱ Загружена interval-рассылка #{b['id']}: '{b['name']}' {schedule_text}")
+            logger.info(f"⏱ Загружена: {b['name']} каждые {b['interval_minutes']} мин")
 
-# ==================== КОМАНДЫ ДЛЯ ВСЕХ ПОЛЬЗОВАТЕЛЕЙ ====================
+# ==================== КОМАНДЫ ДЛЯ ВСЕХ ====================
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     user = message.from_user
     db.add_user(user.id, user.username, user.first_name)
     
-    # Если команда отправлена из группы
     if message.chat.type in ['group', 'supergroup']:
         chat_id = str(message.chat.id)
         chat_name = message.chat.title or f"Группа {chat_id}"
         
-        # Проверяем, есть ли уже такая группа в БД
         existing = db.get_target_group_by_chat_id(chat_id)
         if not existing:
             db.add_target_group(chat_id, chat_name, message.chat.type)
-            if is_admin(message.from_user.id):
-                await message.answer(
-                    f"✅ **Группа добавлена!**\n\n"
-                    f"📢 Название: {chat_name}\n"
-                    f"🆔 ID: `{chat_id}`\n\n"
-                    f"Теперь ты можешь создавать рассылки для этой группы.\n"
-                    f"Используй /admin в админской группе или личке.",
-                    parse_mode="Markdown"
-                )
-            else:
-                await message.answer(
-                    f"✅ **Группа добавлена в базу бота!**\n\n"
-                    f"📢 Название: {chat_name}\n\n"
-                    f"Администратор бота теперь может настраивать рассылки для этой группы.",
-                    parse_mode="Markdown"
-                )
+            await message.answer(
+                f"✅ **Группа добавлена!**\n\n"
+                f"📢 {chat_name}\n"
+                f"🆔 ID: `{chat_id}`\n\n"
+                f"Теперь администратор может создавать рассылки для этой группы.",
+                parse_mode="Markdown"
+            )
+            await send_to_admin(f"➕ **Новая группа**\n{chat_name}\nID: `{chat_id}`")
         else:
-            await message.answer(f"✅ **Группа уже добавлена**\n\n📢 {chat_name}\n\nДля управления используй /admin в админской группе.", parse_mode="Markdown")
+            await message.answer(f"✅ Группа уже добавлена: {chat_name}")
     else:
         await message.answer(
             "✅ **Бот для рассылок в группах!**\n\n"
             "📢 **Как использовать:**\n"
-            "1. Добавь бота в группу для рассылок\n"
-            "2. Назначь бота администратором\n"
-            "3. Отправь в группе команду `/start`\n"
-            "4. Используй /admin в этой админской группе для управления\n\n"
-            "📌 **Админская группа:**\n"
-            f"{'Уже настроена ✅' if ADMIN_GROUP_ID else 'Не настроена. Добавь переменную ADMIN_GROUP_ID в Railway'}\n\n"
-            "Доступные команды:\n"
-            "/start - начать\n"
-            "/id - узнать ID чата\n"
-            "/admin - панель управления (только для админа)",
+            "1. Добавь бота в группу\n"
+            "2. Сделай бота администратором\n"
+            "3. Отправь в группе /start\n"
+            "4. Используй /admin для управления\n\n"
+            f"📌 Админская группа: {'✅ настроена' if ADMIN_GROUP_ID else '❌ не настроена'}\n\n"
+            "Команды:\n"
+            "/start - информация\n"
+            "/id - ID чата\n"
+            "/admin - панель (только для админа)",
             parse_mode="Markdown"
         )
 
 @dp.message(Command("id"))
 async def cmd_id(message: Message):
-    chat_id = message.chat.id
-    chat_type = message.chat.type
-    chat_title = message.chat.title or "Личный чат"
-    
     await message.answer(
-        f"🆔 **Информация об этом чате**\n\n"
-        f"📝 Название: `{chat_title}`\n"
-        f"📝 Тип: `{chat_type}`\n"
-        f"🆔 ID: `{chat_id}`\n\n"
-        f"💡 Скопируй этот ID, если хочешь:\n"
-        f"• Добавить группу для рассылок\n"
-        f"• Настроить админскую группу (ADMIN_GROUP_ID)",
+        f"🆔 **Информация**\n\n"
+        f"📝 Название: {message.chat.title or 'Личный чат'}\n"
+        f"📝 Тип: {message.chat.type}\n"
+        f"🆔 ID: `{message.chat.id}`",
         parse_mode="Markdown"
     )
 
-@dp.message(Command("info"))
-async def cmd_info(message: Message):
-    groups = db.get_all_target_groups()
-    broadcasts = db.get_all_broadcasts()
-    active_broadcasts = len([b for b in broadcasts if b['is_active']])
-    
-    await message.answer(
-        f"📊 **Информация о боте**\n\n"
-        f"📢 Групп для рассылок: `{len(groups)}`\n"
-        f"📋 Всего рассылок: `{len(broadcasts)}`\n"
-        f"✅ Активных рассылок: `{active_broadcasts}`\n"
-        f"🕐 Часовой пояс: `{TIMEZONE}`\n"
-        f"👑 Админская группа: `{ADMIN_GROUP_ID if ADMIN_GROUP_ID else 'Не настроена'}`\n\n"
-        f"👨‍💻 Для управления используй /admin",
-        parse_mode="Markdown"
-    )
-
-# ==================== КОМАНДЫ ДЛЯ АДМИНИСТРАТОРА ====================
+# ==================== КОМАНДЫ ДЛЯ АДМИНА ====================
 @dp.message(Command("admin"))
 async def cmd_admin(message: Message):
-    # Проверяем, что команду отправил админ
     if not is_admin(message.from_user.id):
-        await message.answer("⛔ **У вас нет доступа к этой команде!**", parse_mode="Markdown")
+        await message.answer("⛔ Нет доступа!")
         return
     
-    # Проверяем, что команда отправлена из админской группы (если она настроена)
+    # Проверяем, что команда из админской группы (если она настроена)
     if ADMIN_GROUP_ID and message.chat.id != ADMIN_GROUP_ID and message.chat.type != 'private':
         await message.answer(
-            f"⛔ **Управление ботом доступно только в админской группе!**\n\n"
-            f"📢 ID админской группы: `{ADMIN_GROUP_ID}`\n\n"
-            f"Пожалуйста, перейдите в админскую группу для управления.",
+            f"⛔ **Управление только в админской группе!**\n\n"
+            f"ID админской группы: `{ADMIN_GROUP_ID}`",
             parse_mode="Markdown"
         )
         return
@@ -527,20 +449,18 @@ async def cmd_admin(message: Message):
         [InlineKeyboardButton(text="📋 Все рассылки", callback_data="admin_list")],
         [InlineKeyboardButton(text="⏸ Все рассылки", callback_data="admin_all_toggle")],
         [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
-        [InlineKeyboardButton(text="🕐 Время сервера", callback_data="admin_time")]
+        [InlineKeyboardButton(text="🕐 Время", callback_data="admin_time")]
     ])
     
     groups = db.get_all_target_groups()
     broadcasts = db.get_all_broadcasts()
-    active_broadcasts = len([b for b in broadcasts if b['is_active']])
+    active = len([b for b in broadcasts if b['is_active']])
     
     await message.answer(
         f"🔧 **Панель администратора**\n\n"
-        f"📢 Групп для рассылок: `{len(groups)}`\n"
-        f"📋 Всего рассылок: `{len(broadcasts)}`\n"
-        f"✅ Активных: `{active_broadcasts}`\n"
-        f"🕐 Часовой пояс: `{TIMEZONE}`\n\n"
-        "Выберите действие:",
+        f"📢 Групп: `{len(groups)}`\n"
+        f"📋 Рассылок: `{len(broadcasts)}` (активных: `{active}`)\n"
+        f"🕐 Часовой пояс: `{TIMEZONE}`",
         reply_markup=keyboard,
         parse_mode="Markdown"
     )
@@ -552,14 +472,13 @@ async def cmd_stats(message: Message):
     
     groups = db.get_all_target_groups()
     broadcasts = db.get_all_broadcasts()
-    active_broadcasts = len([b for b in broadcasts if b['is_active']])
+    active = len([b for b in broadcasts if b['is_active']])
     
-    text = f"📊 **Статистика бота**\n\n"
-    text += f"📢 Групп для рассылок: `{len(groups)}`\n"
-    text += f"📋 Всего рассылок: `{len(broadcasts)}`\n"
-    text += f"✅ Активных рассылок: `{active_broadcasts}`\n"
-    text += f"🕐 Часовой пояс: `{TIMEZONE}`\n\n"
-    text += f"**Группы для рассылок:**\n"
+    text = f"📊 **Статистика**\n\n"
+    text += f"📢 Групп: `{len(groups)}`\n"
+    text += f"📋 Рассылок: `{len(broadcasts)}`\n"
+    text += f"✅ Активных: `{active}`\n\n"
+    text += f"**Группы:**\n"
     
     for g in groups:
         group_broadcasts = [b for b in broadcasts if b['group_id'] == g['id']]
@@ -579,8 +498,7 @@ async def cmd_time(message: Message):
     await message.answer(
         f"🕐 **Время на сервере**\n\n"
         f"Часовой пояс: `{TIMEZONE}`\n"
-        f"Текущее время: `{now.strftime('%Y-%m-%d %H:%M:%S')}`\n"
-        f"День недели: `{now.strftime('%A')}`",
+        f"Текущее время: `{now.strftime('%Y-%m-%d %H:%M:%S')}`",
         parse_mode="Markdown"
     )
 
@@ -591,11 +509,11 @@ async def cmd_cancel(message: Message):
     
     if message.from_user.id in admin_states:
         del admin_states[message.from_user.id]
-        await message.answer("❌ Действие отменено")
+        await message.answer("❌ Отменено")
     else:
         await message.answer("Нет активных действий")
 
-# ==================== УПРАВЛЕНИЕ ГРУППАМИ ====================
+# ==================== CALLBACK ОБРАБОТЧИК ====================
 @dp.callback_query()
 async def handle_callback(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
@@ -608,19 +526,14 @@ async def handle_callback(callback: CallbackQuery):
     # Главные меню
     if data == "admin_groups":
         await show_groups_menu(callback.message)
-    
     elif data == "admin_create":
         await start_create_broadcast(callback.message)
-    
     elif data == "admin_list":
-        await show_broadcasts_list(callback.message)
-    
+        await show_all_broadcasts(callback.message)
     elif data == "admin_all_toggle":
         await toggle_all_broadcasts(callback.message)
-    
     elif data == "admin_stats":
         await cmd_stats(callback.message)
-    
     elif data == "admin_time":
         await cmd_time(callback.message)
     
@@ -628,10 +541,10 @@ async def handle_callback(callback: CallbackQuery):
     elif data == "group_add":
         admin_states[callback.from_user.id] = {"step": "add_group_chat_id"}
         await callback.message.answer(
-            "📢 **Добавление группы для рассылок**\n\n"
-            "Отправьте ID группы/канала (можно узнать через команду /id в группе):\n\n"
+            "📢 **Добавление группы**\n\n"
+            "Отправьте ID группы (можно узнать через /id в группе):\n"
             "Пример: `-1001234567890`\n\n"
-            "Или отправьте /cancel для отмены",
+            "Или /cancel",
             parse_mode="Markdown"
         )
     
@@ -642,7 +555,7 @@ async def handle_callback(callback: CallbackQuery):
             new_status = not group['is_active']
             db.toggle_target_group(group_id, 1 if new_status else 0)
             
-            # Включаем/выключаем все рассылки этой группы в планировщике
+            # Обновляем рассылки в планировщике
             broadcasts = db.get_all_broadcasts(group_id)
             for b in broadcasts:
                 job_id = f"broadcast_{b['id']}"
@@ -664,19 +577,18 @@ async def handle_callback(callback: CallbackQuery):
         group_id = int(data.split("_")[2])
         group = db.get_target_group(group_id)
         if group:
-            # Удаляем все рассылки этой группы из планировщика
             broadcasts = db.get_all_broadcasts(group_id)
             for b in broadcasts:
                 if scheduler.get_job(f"broadcast_{b['id']}"):
                     scheduler.remove_job(f"broadcast_{b['id']}")
             db.delete_target_group(group_id)
-            await callback.message.answer(f"🗑 Группа **{group['name']}** и все её рассылки удалены")
+            await callback.message.answer(f"🗑 Группа **{group['name']}** удалена")
             await show_groups_menu(callback.message)
     
     elif data.startswith("group_rename_"):
         group_id = int(data.split("_")[2])
         admin_states[callback.from_user.id] = {"step": "rename_group", "group_id": group_id}
-        await callback.message.answer("✏️ Введите новое название для группы:")
+        await callback.message.answer("✏️ Введите новое название:")
     
     elif data.startswith("group_broadcasts_"):
         group_id = int(data.split("_")[2])
@@ -701,7 +613,7 @@ async def handle_callback(callback: CallbackQuery):
                 if scheduler.get_job(job_id):
                     scheduler.remove_job(job_id)
             await callback.message.answer(f"🔄 Рассылка **{b['name']}** {'включена ✅' if new_status else 'отключена ⛔'}")
-            await show_broadcasts_list(callback.message)
+            await show_all_broadcasts(callback.message)
     
     elif data.startswith("broadcast_delete_"):
         broadcast_id = int(data.split("_")[2])
@@ -711,7 +623,7 @@ async def handle_callback(callback: CallbackQuery):
                 scheduler.remove_job(f"broadcast_{broadcast_id}")
             db.delete_broadcast(broadcast_id)
             await callback.message.answer(f"🗑 Рассылка **{b['name']}** удалена")
-            await show_broadcasts_list(callback.message)
+            await show_all_broadcasts(callback.message)
     
     # Выбор группы для создания рассылки
     elif data.startswith("select_group_"):
@@ -724,13 +636,13 @@ async def handle_callback(callback: CallbackQuery):
                 "group_name": group['name']
             }
             await callback.message.answer(
-                f"📝 **Создание рассылки для группы:** {group['name']}\n\n"
+                f"📝 **Создание рассылки для:** {group['name']}\n\n"
                 f"Введите **название** рассылки:",
                 parse_mode="Markdown"
             )
 
+# ==================== МЕНЮ ПОКАЗА ====================
 async def show_groups_menu(message: types.Message):
-    """Показать меню управления группами для рассылок"""
     groups = db.get_all_target_groups()
     
     text = "📢 **Группы для рассылок**\n\n"
@@ -740,18 +652,145 @@ async def show_groups_menu(message: types.Message):
         text += "Нет добавленных групп.\n\n"
         text += "**Как добавить:**\n"
         text += "1. Добавь бота в группу\n"
-        text += "2. Назначь администратором\n"
+        text += "2. Сделай бота администратором\n"
         text += "3. Отправь в группе /start\n"
-        text += "4. Либо добавь вручную по ID через кнопку ниже\n"
     else:
         for g in groups:
             status = "✅" if g['is_active'] else "⛔"
+            broadcasts_count = len(db.get_all_broadcasts(g['id']))
             text += f"{status} **{g['name']}**\n"
-            text += f"   🆔 ID: `{g['chat_id']}`\n"
-            
-            # Считаем рассылки для этой группы
-            broadcasts = db.get_all_broadcasts(g['id'])
-            text += f"   📋 Рассылок: {len(broadcasts)}\n\n"
+            text += f"   🆔 `{g['chat_id']}`\n"
+            text += f"   📋 {broadcasts_count} рассылок\n\n"
             
             keyboard.inline_keyboard.append([
-                InlineKeyboardButton(text=f"{
+                InlineKeyboardButton(
+                    text=f"{status} {g['name'][:15]}", 
+                    callback_data=f"group_broadcasts_{g['id']}"
+                ),
+                InlineKeyboardButton(text="✏️", callback_data=f"group_rename_{g['id']}"),
+                InlineKeyboardButton(text="🗑", callback_data=f"group_delete_{g['id']}")
+            ])
+    
+    keyboard.inline_keyboard.append([InlineKeyboardButton(text="➕ Добавить группу", callback_data="group_add")])
+    keyboard.inline_keyboard.append([InlineKeyboardButton(text="◀️ Назад", callback_data="admin")])
+    
+    await message.answer(text, parse_mode="Markdown", reply_markup=keyboard)
+
+async def show_group_broadcasts(message: types.Message, group_id: int):
+    group = db.get_target_group(group_id)
+    if not group:
+        await message.answer("❌ Группа не найдена")
+        return
+    
+    broadcasts = db.get_all_broadcasts(group_id)
+    
+    if not broadcasts:
+        await message.answer(
+            f"📭 **{group['name']}** - нет рассылок\n\n"
+            f"Используйте кнопку ниже для создания",
+            parse_mode="Markdown"
+        )
+    else:
+        text = f"📋 **Рассылки:** {group['name']}\n\n"
+        for b in broadcasts:
+            status = "✅" if b['is_active'] else "⛔"
+            if b['schedule_type'] == 'fixed':
+                schedule = f"{b['hour']:02d}:{b['minute']:02d}"
+            else:
+                mins = b['interval_minutes']
+                hours = mins // 60
+                minutes = mins % 60
+                if hours > 0:
+                    schedule = f"каждые {hours}ч {minutes}мин" if minutes > 0 else f"каждые {hours}ч"
+                else:
+                    schedule = f"каждые {minutes}мин"
+            text += f"{status} **{b['name']}** - {schedule}\n"
+        
+        await message.answer(text, parse_mode="Markdown")
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Создать рассылку", callback_data=f"select_group_{group_id}")],
+        [InlineKeyboardButton(text="◀️ Назад к группам", callback_data="admin_groups")]
+    ])
+    await message.answer("Выберите действие:", reply_markup=keyboard)
+
+async def show_all_broadcasts(message: types.Message):
+    broadcasts = db.get_all_broadcasts()
+    
+    if not broadcasts:
+        await message.answer("📭 **Нет созданных рассылок**\n\nИспользуйте кнопку 'Создать рассылку'", parse_mode="Markdown")
+        return
+    
+    text = "📋 **Все рассылки**\n\n"
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[])
+    
+    for b in broadcasts:
+        group = db.get_target_group(b['group_id'])
+        group_name = group['name'] if group else "❓ Неизвестно"
+        status = "✅" if b['is_active'] else "⛔"
+        
+        if b['schedule_type'] == 'fixed':
+            schedule = f"{b['hour']:02d}:{b['minute']:02d}"
+        else:
+            mins = b['interval_minutes']
+            hours = mins // 60
+            minutes = mins % 60
+            if hours > 0:
+                schedule = f"каждые {hours}ч {minutes}мин" if minutes > 0 else f"каждые {hours}ч"
+            else:
+                schedule = f"каждые {minutes}мин"
+        
+        text += f"{status} **{b['name']}**\n"
+        text += f"   📬 {group_name}\n"
+        text += f"   ⏰ {schedule}\n\n"
+        
+        keyboard.inline_keyboard.append([
+            InlineKeyboardButton(text=f"{status} {b['name'][:20]}", callback_data=f"broadcast_toggle_{b['id']}"),
+            InlineKeyboardButton(text="🗑", callback_data=f"broadcast_delete_{b['id']}")
+        ])
+    
+    keyboard.inline_keyboard.append([InlineKeyboardButton(text="◀️ Назад", callback_data="admin")])
+    await message.answer(text, parse_mode="Markdown", reply_markup=keyboard)
+
+async def toggle_all_broadcasts(message: types.Message):
+    broadcasts = db.get_all_broadcasts()
+    active = [b for b in broadcasts if b['is_active']]
+    
+    if active:
+        for b in broadcasts:
+            if b['is_active']:
+                db.update_broadcast(b['id'], is_active=False)
+                if scheduler.get_job(f"broadcast_{b['id']}"):
+                    scheduler.remove_job(f"broadcast_{b['id']}")
+        await message.answer("⛔ **Все рассылки отключены**")
+    else:
+        for b in broadcasts:
+            db.update_broadcast(b['id'], is_active=True)
+            job_id = f"broadcast_{b['id']}"
+            if b['schedule_type'] == 'fixed':
+                trigger = CronTrigger(hour=b['hour'], minute=b['minute'], timezone=TIMEZONE)
+                scheduler.add_job(send_broadcast, trigger, args=[b['id']], id=job_id)
+            elif b['schedule_type'] == 'interval' and b['interval_minutes']:
+                trigger = IntervalTrigger(minutes=b['interval_minutes'])
+                scheduler.add_job(send_broadcast, trigger, args=[b['id']], id=job_id)
+        await message.answer("✅ **Все рассылки включены**")
+
+async def start_create_broadcast(message: types.Message):
+    groups = db.get_all_target_groups()
+    
+    if not groups:
+        await message.answer(
+            "❌ **Нет доступных групп!**\n\n"
+            "Сначала добавьте группы для рассылок:\n"
+            "1. Добавьте бота в группу\n"
+            "2. Сделайте бота администратором\n"
+            "3. Отправьте в группе команду /start",
+            parse_mode="Markdown"
+        )
+        return
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[])
+    for g in groups:
+        if g['is_active']:
+            keyboard.inline_keyboard.append([
+                InlineKeyboardButton
