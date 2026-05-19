@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Файлы окружения
+.env
+.venv
+env/
+
+# База данных
+*.db
+*.sqlite
+*.sqlite3
+
+# Логи
+*.log
+bot.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Файлы сборки
+dist/
+build/
+*.egg-info/
