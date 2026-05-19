@@ -1,6 +1,6 @@
 import sqlite3
 import json
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 from config import DATABASE_PATH
 
 class Database:
@@ -29,24 +29,24 @@ class Database:
                 )
             """)
             
-            # Таблица контента для рассылки
+            # НОВАЯ ТАБЛИЦА: Рассылки (расширенная)
             cursor.execute("""
-                CREATE TABLE IF NOT EXISTS broadcast_content (
+                CREATE TABLE IF NOT EXISTS broadcasts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
                     content_type TEXT NOT NULL, -- 'text' или 'photo'
                     text TEXT,
                     photo_file_id TEXT,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            
-            # Таблица расписания
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS schedule (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    hour INTEGER NOT NULL,
-                    minute INTEGER NOT NULL,
-                    is_active INTEGER DEFAULT 1
+                    schedule_type TEXT DEFAULT 'fixed', -- 'fixed', 'interval', 'cron'
+                    hour INTEGER,  -- для fixed типа
+                    minute INTEGER, -- для fixed типа
+                    interval_minutes INTEGER, -- для interval типа (например, 60, 30, 120)
+                    cron_string TEXT, -- для сложных cron выражений (опционально)
+                    days TEXT,  -- JSON массив: ["mon","tue","wed"] или NULL для ежедневно
+                    is_active INTEGER DEFAULT 1,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_sent_at TIMESTAMP
                 )
             """)
             
@@ -54,17 +54,27 @@ class Database:
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS broadcast_logs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    broadcast_id INTEGER,
                     sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     recipients_count INTEGER,
-                    content_id INTEGER
+                    FOREIGN KEY (broadcast_id) REFERENCES broadcasts(id)
                 )
+            """)
+            
+            # Создаём индексы
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_broadcasts_time 
+                ON broadcasts(hour, minute, is_active)
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_broadcasts_interval 
+                ON broadcasts(interval_minutes, is_active)
             """)
             
             conn.commit()
     
     # === РАБОТА С ПОЛЬЗОВАТЕЛЯМИ ===
     def add_user(self, user_id: int, username: str = None, first_name: str = None, last_name: str = None):
-        """Добавить или обновить пользователя"""
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
@@ -74,99 +84,168 @@ class Database:
             conn.commit()
     
     def remove_user(self, user_id: int):
-        """Отписать пользователя (деактивировать)"""
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("UPDATE users SET is_active = 0 WHERE user_id = ?", (user_id,))
             conn.commit()
     
     def get_active_users(self) -> List[int]:
-        """Получить список активных пользователей"""
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT user_id FROM users WHERE is_active = 1")
             return [row[0] for row in cursor.fetchall()]
     
     def get_all_users(self) -> List[Tuple]:
-        """Получить всех пользователей (с данными)"""
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT * FROM users WHERE is_active = 1 ORDER BY subscribed_at DESC")
             return cursor.fetchall()
     
     def get_user_count(self) -> int:
-        """Количество активных подписчиков"""
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT COUNT(*) FROM users WHERE is_active = 1")
             return cursor.fetchone()[0]
     
-    # === РАБОТА С КОНТЕНТОМ ===
-    def save_content(self, content_type: str, text: str = None, photo_file_id: str = None):
-        """Сохранить контент для рассылки (заменяет старый)"""
+    # === НОВЫЕ МЕТОДЫ ДЛЯ РАБОТЫ С РАССЫЛКАМИ ===
+    
+    def add_broadcast(self, name: str, content_type: str, 
+                      schedule_type: str = 'fixed',
+                      hour: int = None, minute: int = None,
+                      interval_minutes: int = None,
+                      cron_string: str = None,
+                      text: str = None, photo_file_id: str = None, 
+                      days: List[str] = None) -> int:
+        """Добавить новую рассылку с поддержкой разных типов расписания"""
         with self.get_connection() as conn:
             cursor = conn.cursor()
-            # Удаляем старый контент
-            cursor.execute("DELETE FROM broadcast_content")
-            # Добавляем новый
+            days_json = json.dumps(days) if days else None
             cursor.execute("""
-                INSERT INTO broadcast_content (content_type, text, photo_file_id)
-                VALUES (?, ?, ?)
-            """, (content_type, text, photo_file_id))
+                INSERT INTO broadcasts 
+                (name, content_type, text, photo_file_id, 
+                 schedule_type, hour, minute, interval_minutes, cron_string,
+                 days, is_active)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+            """, (name, content_type, text, photo_file_id, 
+                  schedule_type, hour, minute, interval_minutes, cron_string, days_json))
+            conn.commit()
+            return cursor.lastrowid
+    
+    def update_broadcast(self, broadcast_id: int, **kwargs):
+        """Обновить рассылку"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            allowed_fields = ['name', 'content_type', 'text', 'photo_file_id', 
+                             'schedule_type', 'hour', 'minute', 'interval_minutes', 
+                             'cron_string', 'days', 'is_active']
+            updates = []
+            values = []
+            
+            for key, value in kwargs.items():
+                if key in allowed_fields:
+                    if key == 'days' and value is not None:
+                        value = json.dumps(value)
+                    updates.append(f"{key} = ?")
+                    values.append(value)
+            
+            if updates:
+                values.append(broadcast_id)
+                query = f"UPDATE broadcasts SET {', '.join(updates)}, updated_at = CURRENT_TIMESTAMP WHERE id = ?"
+                cursor.execute(query, values)
+                conn.commit()
+    
+    def delete_broadcast(self, broadcast_id: int):
+        """Удалить рассылку"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM broadcasts WHERE id = ?", (broadcast_id,))
             conn.commit()
     
-    def get_content(self) -> Optional[Tuple]:
-        """Получить текущий контент для рассылки"""
+    def get_all_broadcasts(self) -> List[Dict]:
+        """Получить все рассылки"""
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                SELECT content_type, text, photo_file_id 
-                FROM broadcast_content 
-                ORDER BY id DESC LIMIT 1
+                SELECT id, name, content_type, text, photo_file_id, 
+                       schedule_type, hour, minute, interval_minutes, cron_string,
+                       days, is_active, created_at, updated_at, last_sent_at
+                FROM broadcasts 
+                ORDER BY created_at DESC
             """)
-            return cursor.fetchone()
+            rows = cursor.fetchall()
+            
+            broadcasts = []
+            for row in rows:
+                broadcasts.append({
+                    'id': row[0],
+                    'name': row[1],
+                    'content_type': row[2],
+                    'text': row[3],
+                    'photo_file_id': row[4],
+                    'schedule_type': row[5],
+                    'hour': row[6],
+                    'minute': row[7],
+                    'interval_minutes': row[8],
+                    'cron_string': row[9],
+                    'days': json.loads(row[10]) if row[10] else None,
+                    'is_active': bool(row[11]),
+                    'created_at': row[12],
+                    'updated_at': row[13],
+                    'last_sent_at': row[14]
+                })
+            return broadcasts
     
-    # === РАБОТА С РАСПИСАНИЕМ ===
-    def set_schedule(self, hour: int, minute: int):
-        """Установить расписание (заменяет старое)"""
+    def get_broadcast(self, broadcast_id: int) -> Optional[Dict]:
+        """Получить одну рассылку по ID"""
         with self.get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("DELETE FROM schedule")
             cursor.execute("""
-                INSERT INTO schedule (hour, minute, is_active)
-                VALUES (?, ?, 1)
-            """, (hour, minute))
+                SELECT id, name, content_type, text, photo_file_id, 
+                       schedule_type, hour, minute, interval_minutes, cron_string,
+                       days, is_active, created_at, updated_at, last_sent_at
+                FROM broadcasts WHERE id = ?
+            """, (broadcast_id,))
+            row = cursor.fetchone()
+            
+            if row:
+                return {
+                    'id': row[0],
+                    'name': row[1],
+                    'content_type': row[2],
+                    'text': row[3],
+                    'photo_file_id': row[4],
+                    'schedule_type': row[5],
+                    'hour': row[6],
+                    'minute': row[7],
+                    'interval_minutes': row[8],
+                    'cron_string': row[9],
+                    'days': json.loads(row[10]) if row[10] else None,
+                    'is_active': bool(row[11]),
+                    'created_at': row[12],
+                    'updated_at': row[13],
+                    'last_sent_at': row[14]
+                }
+            return None
+    
+    def update_last_sent(self, broadcast_id: int):
+        """Обновить время последней отправки"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE broadcasts SET last_sent_at = CURRENT_TIMESTAMP 
+                WHERE id = ?
+            """, (broadcast_id,))
             conn.commit()
     
-    def get_schedule(self) -> Optional[Tuple[int, int]]:
-        """Получить текущее расписание"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT hour, minute FROM schedule WHERE is_active = 1 LIMIT 1")
-            result = cursor.fetchone()
-            return result if result else None
-    
-    # === ЛОГИ ===
-    def log_broadcast(self, recipients_count: int, content_id: int = None):
-        """Записать лог рассылки"""
+    def log_broadcast(self, broadcast_id: int, recipients_count: int):
+        """Записать лог отправки"""
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                INSERT INTO broadcast_logs (recipients_count, content_id)
+                INSERT INTO broadcast_logs (broadcast_id, recipients_count)
                 VALUES (?, ?)
-            """, (recipients_count, content_id))
+            """, (broadcast_id, recipients_count))
             conn.commit()
-    
-    def get_last_broadcast_time(self):
-        """Время последней рассылки"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT sent_at, recipients_count 
-                FROM broadcast_logs 
-                ORDER BY sent_at DESC LIMIT 1
-            """)
-            return cursor.fetchone()
 
 # Создаём глобальный экземпляр
 db = Database()
