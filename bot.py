@@ -792,5 +792,253 @@ async def start_create_broadcast(message: types.Message):
     keyboard = InlineKeyboardMarkup(inline_keyboard=[])
     for g in groups:
         if g['is_active']:
-            keyboard.inline_keyboard.append([
-                InlineKeyboardButton
+                        keyboard.inline_keyboard.append([
+                InlineKeyboardButton(text=f"📢 {g['name']}", callback_data=f"select_group_{g['id']}")
+            ])
+    
+    keyboard.inline_keyboard.append([InlineKeyboardButton(text="◀️ Назад", callback_data="admin")])
+    
+    await message.answer(
+        "📝 **Выберите группу для рассылки:**",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+
+# ==================== СОЗДАНИЕ РАССЫЛКИ (ПОШАГОВО) ====================
+@dp.message()
+async def handle_input(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    
+    if message.from_user.id not in admin_states:
+        return
+    
+    state = admin_states[message.from_user.id]
+    step = state.get("step")
+    
+    # Шаг 1: Название
+    if step == "create_name":
+        state["name"] = message.text
+        state["step"] = "create_type"
+        await message.answer(
+            "📝 **Тип контента**\n\n"
+            "Отправьте:\n"
+            "`текст` - текстовая рассылка\n"
+            "`фото` - рассылка с фото",
+            parse_mode="Markdown"
+        )
+    
+    # Шаг 2: Тип контента
+    elif step == "create_type":
+        if message.text.lower() in ["текст", "text"]:
+            state["content_type"] = "text"
+            state["step"] = "create_text"
+            await message.answer("📝 Отправьте **текст** рассылки:", parse_mode="Markdown")
+        elif message.text.lower() in ["фото", "photo"]:
+            state["content_type"] = "photo"
+            state["step"] = "create_photo"
+            await message.answer("🖼 Отправьте **фото** (можно с подписью):", parse_mode="Markdown")
+        else:
+            await message.answer("❌ Отправьте 'текст' или 'фото'")
+    
+    # Шаг 3a: Текст
+    elif step == "create_text":
+        state["text"] = message.text
+        state["step"] = "create_schedule_type"
+        await message.answer(
+            "⏰ **Тип расписания**\n\n"
+            "Отправьте:\n"
+            "`1` - В определённое время (ежедневно)\n"
+            "`2` - Каждый час / с интервалом",
+            parse_mode="Markdown"
+        )
+    
+    # Шаг 3b: Фото
+    elif step == "create_photo":
+        if message.photo:
+            state["photo_file_id"] = message.photo[-1].file_id
+            state["text"] = message.caption or ""
+            state["step"] = "create_schedule_type"
+            await message.answer(
+                "⏰ **Тип расписания**\n\n"
+                "Отправьте:\n"
+                "`1` - В определённое время\n"
+                "`2` - Каждый час / с интервалом",
+                parse_mode="Markdown"
+            )
+        else:
+            await message.answer("❌ Отправьте фото")
+    
+    # Шаг 4: Выбор типа расписания
+    elif step == "create_schedule_type":
+        if message.text == "1":
+            state["schedule_type"] = "fixed"
+            state["step"] = "create_fixed_time"
+            await message.answer(
+                f"⏰ Введите **время** в формате `HH:MM`\n\n"
+                f"🕐 Часовой пояс: `{TIMEZONE}`\n"
+                f"Пример: `09:30` или `18:00`",
+                parse_mode="Markdown"
+            )
+        elif message.text == "2":
+            state["schedule_type"] = "interval"
+            state["step"] = "create_interval"
+            await message.answer(
+                "⏰ **Интервал в минутах**\n\n"
+                "Примеры:\n"
+                "`60` - каждый час\n"
+                "`30` - каждые 30 минут\n"
+                "`120` - каждые 2 часа\n\n"
+                "Отправьте число:",
+                parse_mode="Markdown"
+            )
+        else:
+            await message.answer("❌ Отправьте 1 или 2")
+    
+    # Шаг 5a: Фиксированное время
+    elif step == "create_fixed_time":
+        try:
+            hour, minute = map(int, message.text.split(':'))
+            if 0 <= hour <= 23 and 0 <= minute <= 59:
+                state["hour"] = hour
+                state["minute"] = minute
+                
+                # Сохраняем рассылку
+                broadcast_id = db.add_broadcast(
+                    group_id=state["group_id"],
+                    name=state["name"],
+                    content_type=state["content_type"],
+                    schedule_type="fixed",
+                    text=state.get("text"),
+                    photo_file_id=state.get("photo_file_id"),
+                    hour=hour,
+                    minute=minute
+                )
+                
+                # Добавляем в планировщик
+                trigger = CronTrigger(hour=hour, minute=minute, timezone=TIMEZONE)
+                scheduler.add_job(send_broadcast, trigger, args=[broadcast_id], id=f"broadcast_{broadcast_id}")
+                
+                group = db.get_target_group(state["group_id"])
+                
+                await message.answer(
+                    f"✅ **Рассылка создана!**\n\n"
+                    f"📢 Название: **{state['name']}**\n"
+                    f"📬 Группа: {group['name']}\n"
+                    f"⏰ Время: {hour:02d}:{minute:02d} ({TIMEZONE})\n\n"
+                    f"Используйте /admin для управления",
+                    parse_mode="Markdown"
+                )
+                
+                await send_to_admin(
+                    f"➕ **Новая рассылка**\n"
+                    f"📢 {state['name']}\n"
+                    f"📬 {group['name']}\n"
+                    f"⏰ {hour:02d}:{minute:02d}"
+                )
+                
+                del admin_states[message.from_user.id]
+            else:
+                raise ValueError
+        except:
+            await message.answer("❌ Неверный формат. Пример: 09:30")
+    
+    # Шаг 5b: Интервал
+    elif step == "create_interval":
+        try:
+            interval = int(message.text)
+            if interval <= 0:
+                raise ValueError
+            
+            state["interval_minutes"] = interval
+            
+            # Сохраняем рассылку
+            broadcast_id = db.add_broadcast(
+                group_id=state["group_id"],
+                name=state["name"],
+                content_type=state["content_type"],
+                schedule_type="interval",
+                text=state.get("text"),
+                photo_file_id=state.get("photo_file_id"),
+                interval_minutes=interval
+            )
+            
+            # Добавляем в планировщик
+            trigger = IntervalTrigger(minutes=interval)
+            scheduler.add_job(send_broadcast, trigger, args=[broadcast_id], id=f"broadcast_{broadcast_id}")
+            
+            group = db.get_target_group(state["group_id"])
+            
+            hours = interval // 60
+            minutes = interval % 60
+            if hours > 0:
+                schedule_text = f"каждые {hours}ч {minutes}мин" if minutes > 0 else f"каждые {hours}ч"
+            else:
+                schedule_text = f"каждые {minutes}мин"
+            
+            await message.answer(
+                f"✅ **Рассылка создана!**\n\n"
+                f"📢 Название: **{state['name']}**\n"
+                f"📬 Группа: {group['name']}\n"
+                f"⏰ Расписание: {schedule_text}\n\n"
+                f"Используйте /admin для управления",
+                parse_mode="Markdown"
+            )
+            
+            await send_to_admin(
+                f"➕ **Новая рассылка**\n"
+                f"📢 {state['name']}\n"
+                f"📬 {group['name']}\n"
+                f"⏰ {schedule_text}"
+            )
+            
+            del admin_states[message.from_user.id]
+        except:
+            await message.answer("❌ Введите положительное число (минуты)")
+    
+    # Переименование группы
+    elif step == "rename_group":
+        group_id = state["group_id"]
+        db.update_target_group_name(group_id, message.text)
+        await message.answer(f"✅ Группа переименована в: {message.text}")
+        del admin_states[message.from_user.id]
+        await show_groups_menu(message)
+    
+    # Добавление группы по ID
+    elif step == "add_group_chat_id":
+        chat_id = message.text.strip()
+        try:
+            # Проверяем, что ID корректный
+            int(chat_id)
+            existing = db.get_target_group_by_chat_id(chat_id)
+            if existing:
+                await message.answer(f"❌ Группа с ID {chat_id} уже добавлена!")
+            else:
+                db.add_target_group(chat_id, f"Группа {chat_id}", "manual")
+                await message.answer(f"✅ Группа с ID `{chat_id}` добавлена!\n\nТеперь можно создавать рассылки.", parse_mode="Markdown")
+                await send_to_admin(f"➕ **Группа добавлена вручную**\nID: `{chat_id}`")
+            del admin_states[message.from_user.id]
+            await show_groups_menu(message)
+        except:
+            await message.answer("❌ Неверный формат ID. ID должен быть числом.\nПример: `-1001234567890`")
+
+# ==================== ЗАПУСК БОТА ====================
+async def main():
+    logger.info("🚀 Бот запускается...")
+    logger.info(f"📅 Часовой пояс: {TIMEZONE}")
+    logger.info(f"👑 Админ ID: {ADMIN_ID}")
+    logger.info(f"📢 Админская группа: {ADMIN_GROUP_ID if ADMIN_GROUP_ID else 'Не настроена'}")
+    
+    await load_all_broadcasts()
+    scheduler.start()
+    
+    logger.info("✅ Бот готов к работе!")
+    
+    # Уведомление в админскую группу
+    if ADMIN_GROUP_ID:
+        await send_to_admin("✅ **Бот перезапущен и готов к работе!**")
+    
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
