@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 from datetime import datetime
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -8,17 +9,21 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
-from config import BOT_TOKEN, ADMIN_ID, TIMEZONE
-from database import db
+# Настройки из переменных окружения
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow")
+
+# Проверка наличия токена
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN не найден! Добавь переменную в Railway")
+if not ADMIN_ID:
+    raise ValueError("ADMIN_ID не найден! Добавь переменную в Railway")
 
 # Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('bot.log'),
-        logging.StreamHandler()
-    ]
+    format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
@@ -26,289 +31,279 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 scheduler = AsyncIOScheduler(timezone=TIMEZONE)
 
-# Временные хранилища для состояний админа
+# Временное хранилище для состояний админа
 admin_states = {}
 
-# === ДЕКОРАТОР ДЛЯ ПРОВЕРКИ АДМИНА ===
-def admin_only(func):
-    async def wrapper(message: Message, *args, **kwargs):
-        if message.from_user.id != ADMIN_ID:
-            await message.answer("⛔ У вас нет доступа к этой команде.")
-            logger.warning(f"Неавторизованная попытка от {message.from_user.id}")
-            return
-        return await func(message, *args, **kwargs)
-    return wrapper
+# База данных (простая версия для начала)
+import sqlite3
+import json
 
-# === ФУНКЦИЯ ОТПРАВКИ РАССЫЛКИ ===
+class SimpleDB:
+    def __init__(self):
+        self.conn = sqlite3.connect('bot_database.db', check_same_thread=False)
+        self.init_tables()
+    
+    def init_tables(self):
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                subscribed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                is_active INTEGER DEFAULT 1
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS broadcasts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT,
+                content_type TEXT,
+                text TEXT,
+                photo_file_id TEXT,
+                schedule_type TEXT,
+                hour INTEGER,
+                minute INTEGER,
+                interval_minutes INTEGER,
+                days TEXT,
+                is_active INTEGER DEFAULT 1,
+                last_sent_at TIMESTAMP
+            )
+        ''')
+        self.conn.commit()
+    
+    def add_user(self, user_id, username=None, first_name=None):
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO users (user_id, username, first_name, is_active)
+            VALUES (?, ?, ?, 1)
+        ''', (user_id, username, first_name))
+        self.conn.commit()
+    
+    def remove_user(self, user_id):
+        cursor = self.conn.cursor()
+        cursor.execute('UPDATE users SET is_active = 0 WHERE user_id = ?', (user_id,))
+        self.conn.commit()
+    
+    def get_active_users(self):
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT user_id FROM users WHERE is_active = 1')
+        return [row[0] for row in cursor.fetchall()]
+    
+    def get_user_count(self):
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT COUNT(*) FROM users WHERE is_active = 1')
+        return cursor.fetchone()[0]
+    
+    def get_all_users(self):
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT user_id, username, first_name FROM users WHERE is_active = 1')
+        return cursor.fetchall()
+    
+    def add_broadcast(self, name, content_type, schedule_type, text=None, photo_file_id=None,
+                      hour=None, minute=None, interval_minutes=None, days=None):
+        cursor = self.conn.cursor()
+        days_json = json.dumps(days) if days else None
+        cursor.execute('''
+            INSERT INTO broadcasts (name, content_type, text, photo_file_id, schedule_type,
+                                    hour, minute, interval_minutes, days, is_active)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+        ''', (name, content_type, text, photo_file_id, schedule_type, hour, minute, interval_minutes, days_json))
+        self.conn.commit()
+        return cursor.lastrowid
+    
+    def get_all_broadcasts(self):
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT id, name, content_type, schedule_type, hour, minute, interval_minutes, days, is_active, last_sent_at FROM broadcasts')
+        rows = cursor.fetchall()
+        result = []
+        for row in rows:
+            result.append({
+                'id': row[0],
+                'name': row[1],
+                'content_type': row[2],
+                'schedule_type': row[3],
+                'hour': row[4],
+                'minute': row[5],
+                'interval_minutes': row[6],
+                'days': json.loads(row[7]) if row[7] else None,
+                'is_active': bool(row[8]),
+                'last_sent_at': row[9]
+            })
+        return result
+    
+    def get_broadcast(self, broadcast_id):
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT id, name, content_type, text, photo_file_id, schedule_type, hour, minute, interval_minutes, days, is_active, last_sent_at FROM broadcasts WHERE id = ?', (broadcast_id,))
+        row = cursor.fetchone()
+        if row:
+            return {
+                'id': row[0],
+                'name': row[1],
+                'content_type': row[2],
+                'text': row[3],
+                'photo_file_id': row[4],
+                'schedule_type': row[5],
+                'hour': row[6],
+                'minute': row[7],
+                'interval_minutes': row[8],
+                'days': json.loads(row[9]) if row[9] else None,
+                'is_active': bool(row[10]),
+                'last_sent_at': row[11]
+            }
+        return None
+    
+    def update_broadcast(self, broadcast_id, **kwargs):
+        cursor = self.conn.cursor()
+        allowed = ['name', 'content_type', 'text', 'photo_file_id', 'hour', 'minute', 'interval_minutes', 'days', 'is_active']
+        updates = []
+        values = []
+        for key, value in kwargs.items():
+            if key in allowed:
+                if key == 'days' and value is not None:
+                    value = json.dumps(value)
+                updates.append(f"{key} = ?")
+                values.append(value)
+        if updates:
+            values.append(broadcast_id)
+            cursor.execute(f"UPDATE broadcasts SET {', '.join(updates)} WHERE id = ?", values)
+            self.conn.commit()
+    
+    def delete_broadcast(self, broadcast_id):
+        cursor = self.conn.cursor()
+        cursor.execute('DELETE FROM broadcasts WHERE id = ?', (broadcast_id,))
+        self.conn.commit()
+    
+    def update_last_sent(self, broadcast_id):
+        cursor = self.conn.cursor()
+        cursor.execute('UPDATE broadcasts SET last_sent_at = CURRENT_TIMESTAMP WHERE id = ?', (broadcast_id,))
+        self.conn.commit()
+    
+    def log_broadcast(self, broadcast_id, count):
+        pass  # для простоты
+
+db = SimpleDB()
+
+# === ФУНКЦИЯ ПРОВЕРКИ АДМИНА ===
+def is_admin(user_id):
+    return user_id == ADMIN_ID
+
+# === ОТПРАВКА РАССЫЛКИ ===
 async def send_broadcast(broadcast_id: int):
     logger.info(f"Запуск рассылки #{broadcast_id}")
-    
     broadcast = db.get_broadcast(broadcast_id)
     if not broadcast or not broadcast['is_active']:
         return
     
     users = db.get_active_users()
     if not users:
-        logger.info("Нет активных подписчиков")
+        logger.info("Нет подписчиков")
         return
     
-    success_count = 0
+    success = 0
     for user_id in users:
         try:
-            if broadcast['content_type'] == "text" and broadcast['text']:
+            if broadcast['content_type'] == 'text' and broadcast['text']:
                 await bot.send_message(user_id, broadcast['text'])
-                success_count += 1
-            elif broadcast['content_type'] == "photo" and broadcast['photo_file_id']:
-                await bot.send_photo(user_id, broadcast['photo_file_id'], 
-                                     caption=broadcast['text'] or "")
-                success_count += 1
+                success += 1
+            elif broadcast['content_type'] == 'photo' and broadcast['photo_file_id']:
+                await bot.send_photo(user_id, broadcast['photo_file_id'], caption=broadcast['text'] or "")
+                success += 1
             await asyncio.sleep(0.05)
         except Exception as e:
             logger.error(f"Ошибка {user_id}: {e}")
-            if "bot was blocked" in str(e).lower():
+            if 'blocked' in str(e).lower():
                 db.remove_user(user_id)
     
     db.update_last_sent(broadcast_id)
-    db.log_broadcast(broadcast_id, success_count)
-    logger.info(f"Рассылка #{broadcast_id}: {success_count}/{len(users)}")
+    logger.info(f"Рассылка #{broadcast_id}: {success}/{len(users)}")
 
 # === ЗАГРУЗКА РАССЫЛОК ===
-async def load_all_broadcasts():
-    broadcasts = db.get_all_broadcasts()
-    for broadcast in broadcasts:
-        if broadcast['is_active']:
-            await add_broadcast_to_scheduler(broadcast)
-    logger.info(f"Загружено {len([b for b in broadcasts if b['is_active']])} активных рассылок")
+async def load_broadcasts():
+    for b in db.get_all_broadcasts():
+        if b['is_active']:
+            job_id = f"broadcast_{b['id']}"
+            if scheduler.get_job(job_id):
+                scheduler.remove_job(job_id)
+            
+            if b['schedule_type'] == 'fixed' and b['hour'] is not None:
+                trigger = CronTrigger(hour=b['hour'], minute=b['minute'])
+                scheduler.add_job(send_broadcast, trigger, args=[b['id']], id=job_id)
+                logger.info(f"Загружена рассылка #{b['id']}: {b['hour']:02d}:{b['minute']:02d}")
+            elif b['schedule_type'] == 'interval' and b['interval_minutes']:
+                trigger = IntervalTrigger(minutes=b['interval_minutes'])
+                scheduler.add_job(send_broadcast, trigger, args=[b['id']], id=job_id)
+                logger.info(f"Загружена рассылка #{b['id']}: каждые {b['interval_minutes']} мин")
 
-async def add_broadcast_to_scheduler(broadcast: dict):
-    broadcast_id = broadcast['id']
-    schedule_type = broadcast['schedule_type']
-    job_id = f"broadcast_{broadcast_id}"
-    
-    if scheduler.get_job(job_id):
-        scheduler.remove_job(job_id)
-    
-    if schedule_type == 'interval':
-        interval_minutes = broadcast['interval_minutes']
-        if interval_minutes:
-            trigger = IntervalTrigger(minutes=interval_minutes)
-        else:
-            return
-    elif schedule_type == 'fixed':
-        hour = broadcast['hour']
-        minute = broadcast['minute']
-        days = broadcast['days']
-        
-        if days:
-            day_map = {'mon': 'mon', 'tue': 'tue', 'wed': 'wed', 'thu': 'thu', 
-                       'fri': 'fri', 'sat': 'sat', 'sun': 'sun'}
-            trigger = CronTrigger(
-                hour=hour, 
-                minute=minute, 
-                day_of_week=','.join([day_map[d] for d in days])
-            )
-        else:
-            trigger = CronTrigger(hour=hour, minute=minute)
-    else:
-        return
-    
-    scheduler.add_job(send_broadcast, trigger, args=[broadcast_id], id=job_id, replace_existing=True)
-
-# === КОМАНДЫ ПОЛЬЗОВАТЕЛЕЙ ===
+# === КОМАНДЫ ДЛЯ ВСЕХ ===
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     user = message.from_user
-    db.add_user(user.id, user.username, user.first_name, user.last_name)
-    await message.answer("✅ Вы подписались на рассылку!\n\n/stop - отписаться\n/info - информация")
+    db.add_user(user.id, user.username, user.first_name)
+    await message.answer(
+        "✅ **Вы подписались на рассылку!**\n\n"
+        "Доступные команды:\n"
+        "/start - подписаться\n"
+        "/stop - отписаться\n"
+        "/info - информация\n"
+        "/id - узнать свой ID",
+        parse_mode="Markdown"
+    )
 
 @dp.message(Command("stop"))
 async def cmd_stop(message: Message):
     db.remove_user(message.from_user.id)
-    await message.answer("❌ Вы отписались от рассылки.")
+    await message.answer("❌ Вы отписались от рассылки. /start - чтобы подписаться снова")
 
 @dp.message(Command("info"))
 async def cmd_info(message: Message):
-    is_active = message.from_user.id in db.get_active_users()
-    if is_active:
-        await message.answer("📊 Вы активный подписчик.")
-    else:
-        await message.answer("📊 Вы не подписаны. Нажмите /start")
+    users = db.get_active_users()
+    is_subscribed = message.from_user.id in users
+    status = "✅ Подписан" if is_subscribed else "❌ Не подписан"
+    await message.answer(f"📊 **Ваш статус:** {status}", parse_mode="Markdown")
 
 @dp.message(Command("id"))
 async def cmd_id(message: Message):
-    await message.answer(f"🆔 Ваш ID: `{message.from_user.id}`", parse_mode="Markdown")
+    await message.answer(f"🆔 **Ваш ID:** `{message.from_user.id}`", parse_mode="Markdown")
 
-# === АДМИН КОМАНДЫ ===
+# === КОМАНДЫ ДЛЯ АДМИНА ===
 @dp.message(Command("admin"))
-@admin_only
-async def admin_menu(message: Message):
+async def cmd_admin(message: Message):
+    """Главная админ-панель"""
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ **У вас нет доступа к этой команде!**\n\nЭта команда только для администратора бота.", parse_mode="Markdown")
+        logger.warning(f"Неавторизованный доступ к /admin от {message.from_user.id}")
+        return
+    
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Создать рассылку", callback_data="admin_create")],
         [InlineKeyboardButton(text="📋 Список рассылок", callback_data="admin_list")],
-        [InlineKeyboardButton(text="⏸ Все рассылки", callback_data="admin_all_toggle")],
         [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
-        [InlineKeyboardButton(text="👥 Подписчики", callback_data="admin_users")]
-    ])
-    await message.answer("🔧 **Панель администратора**", reply_markup=keyboard, parse_mode="Markdown")
-
-# === ОБРАБОТЧИК CALLBACK ===
-@dp.callback_query()
-async def handle_callback(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("⛔ Нет доступа!", show_alert=True)
-        return
-    
-    data = callback.data
-    
-    if data == "admin_create":
-        admin_states[ADMIN_ID] = {"step": "create_name"}
-        await callback.message.answer("📝 Введите **название** рассылки:", parse_mode="Markdown")
-    
-    elif data == "admin_list":
-        await show_broadcasts_list(callback.message)
-    
-    elif data == "admin_stats":
-        await admin_stats_command(callback.message)
-    
-    elif data == "admin_users":
-        await admin_users_command(callback.message)
-    
-    elif data == "admin_all_toggle":
-        await toggle_all_broadcasts(callback.message)
-    
-    elif data.startswith("broadcast_edit_"):
-        broadcast_id = int(data.split("_")[2])
-        await show_broadcast_actions(callback.message, broadcast_id)
-    
-    elif data.startswith("broadcast_toggle_"):
-        broadcast_id = int(data.split("_")[2])
-        broadcast = db.get_broadcast(broadcast_id)
-        if broadcast:
-            new_status = not broadcast['is_active']
-            db.update_broadcast(broadcast_id, is_active=new_status)
-            if new_status:
-                await add_broadcast_to_scheduler(db.get_broadcast(broadcast_id))
-            else:
-                job_id = f"broadcast_{broadcast_id}"
-                if scheduler.get_job(job_id):
-                    scheduler.remove_job(job_id)
-            await callback.answer(f"Рассылка {'включена ✅' if new_status else 'отключена ⛔'}")
-            await show_broadcasts_list(callback.message)
-    
-    elif data.startswith("broadcast_delete_"):
-        broadcast_id = int(data.split("_")[2])
-        job_id = f"broadcast_{broadcast_id}"
-        if scheduler.get_job(job_id):
-            scheduler.remove_job(job_id)
-        db.delete_broadcast(broadcast_id)
-        await callback.answer("🗑 Рассылка удалена")
-        await show_broadcasts_list(callback.message)
-    
-    await callback.answer()
-
-async def toggle_all_broadcasts(message: types.Message):
-    broadcasts = db.get_all_broadcasts()
-    active_broadcasts = [b for b in broadcasts if b['is_active']]
-    
-    if active_broadcasts:
-        for b in broadcasts:
-            if b['is_active']:
-                db.update_broadcast(b['id'], is_active=False)
-                job_id = f"broadcast_{b['id']}"
-                if scheduler.get_job(job_id):
-                    scheduler.remove_job(job_id)
-        await message.answer("⛔ **Все рассылки отключены**", parse_mode="Markdown")
-    else:
-        for b in broadcasts:
-            db.update_broadcast(b['id'], is_active=True)
-            await add_broadcast_to_scheduler(db.get_broadcast(b['id']))
-        await message.answer("✅ **Все рассылки включены**", parse_mode="Markdown")
-
-async def show_broadcasts_list(message: types.Message):
-    broadcasts = db.get_all_broadcasts()
-    
-    if not broadcasts:
-        await message.answer("📭 **Нет созданных рассылок**\n\nИспользуйте /admin", parse_mode="Markdown")
-        return
-    
-    text = "📋 **Список рассылок**\n\n"
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[])
-    
-    for b in broadcasts:
-        status = "✅" if b['is_active'] else "⛔"
-        
-        if b['schedule_type'] == 'fixed':
-            days_str = ", ".join(b['days']) if b['days'] else "ежедневно"
-            schedule_str = f"{b['hour']:02d}:{b['minute']:02d} ({days_str})"
-        elif b['schedule_type'] == 'interval':
-            mins = b['interval_minutes']
-            hours = mins // 60
-            minutes = mins % 60
-            if hours > 0:
-                schedule_str = f"каждые {hours}ч {minutes}мин" if minutes > 0 else f"каждые {hours}ч"
-            else:
-                schedule_str = f"каждые {minutes}мин"
-        else:
-            schedule_str = "неизвестно"
-        
-        text += f"{status} **{b['name']}**\n"
-        text += f"   ⏰ {schedule_str}\n"
-        text += f"   📝 ID: {b['id']}\n\n"
-        
-        keyboard.inline_keyboard.append([
-            InlineKeyboardButton(text=f"{status} {b['name'][:25]}", callback_data=f"broadcast_edit_{b['id']}")
-        ])
-    
-    keyboard.inline_keyboard.append([InlineKeyboardButton(text="◀️ Назад", callback_data="admin")])
-    await message.answer(text, parse_mode="Markdown", reply_markup=keyboard)
-
-async def show_broadcast_actions(message: types.Message, broadcast_id: int):
-    broadcast = db.get_broadcast(broadcast_id)
-    if not broadcast:
-        await message.answer("❌ Рассылка не найдена")
-        return
-    
-    status_text = "Включена ✅" if broadcast['is_active'] else "Отключена ⛔"
-    
-    if broadcast['schedule_type'] == 'fixed':
-        days_str = ", ".join(broadcast['days']) if broadcast['days'] else "ежедневно"
-        schedule_text = f"{broadcast['hour']:02d}:{broadcast['minute']:02d} ({days_str})"
-    elif broadcast['schedule_type'] == 'interval':
-        mins = broadcast['interval_minutes']
-        hours = mins // 60
-        minutes = mins % 60
-        if hours > 0:
-            schedule_text = f"каждые {hours}ч {minutes}мин" if minutes > 0 else f"каждые {hours}ч"
-        else:
-            schedule_text = f"каждые {minutes}мин"
-    else:
-        schedule_text = "неизвестно"
-    
-    text = f"📢 **{broadcast['name']}**\n\n"
-    text += f"🕐 Расписание: {schedule_text}\n"
-    text += f"🔘 Статус: {status_text}\n"
-    text += f"📝 Тип: {'📷 Фото' if broadcast['content_type'] == 'photo' else '📝 Текст'}\n"
-    
-    if broadcast['last_sent_at']:
-        text += f"📨 Последняя отправка: {broadcast['last_sent_at']}\n"
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Вкл/Выкл", callback_data=f"broadcast_toggle_{broadcast_id}")],
-        [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"broadcast_delete_{broadcast_id}")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="admin_list")]
+        [InlineKeyboardButton(text="👥 Подписчики", callback_data="admin_users")],
+        [InlineKeyboardButton(text="⏸ Все рассылки", callback_data="admin_all_toggle")]
     ])
     
-    await message.answer(text, parse_mode="Markdown", reply_markup=keyboard)
+    await message.answer(
+        "🔧 **Панель администратора**\n\n"
+        f"👥 Подписчиков: {db.get_user_count()}\n"
+        f"📢 Рассылок: {len(db.get_all_broadcasts())}\n\n"
+        "Выберите действие:",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
 
 @dp.message(Command("stats"))
-@admin_only
-async def admin_stats_command(message: Message):
+async def cmd_stats(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Нет доступа!")
+        return
+    
     users_count = db.get_user_count()
     broadcasts = db.get_all_broadcasts()
     active_count = len([b for b in broadcasts if b['is_active']])
     
     await message.answer(
-        f"📊 **Статистика**\n\n"
+        f"📊 **Статистика бота**\n\n"
         f"👥 Подписчиков: {users_count}\n"
         f"📢 Всего рассылок: {len(broadcasts)}\n"
         f"✅ Активных: {active_count}",
@@ -316,14 +311,17 @@ async def admin_stats_command(message: Message):
     )
 
 @dp.message(Command("users"))
-@admin_only
-async def admin_users_command(message: Message):
-    users = db.get_all_users()
-    if not users:
-        await message.answer("📭 Нет подписчиков")
+async def cmd_users(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Нет доступа!")
         return
     
-    text = "📋 **Подписчики:**\n\n"
+    users = db.get_all_users()
+    if not users:
+        await message.answer("📭 Нет активных подписчиков")
+        return
+    
+    text = "📋 **Активные подписчики:**\n\n"
     for user in users[:30]:
         name = user[2] or user[1] or "Аноним"
         text += f"• {name} - ID: `{user[0]}`\n"
@@ -334,108 +332,167 @@ async def admin_users_command(message: Message):
     await message.answer(text, parse_mode="Markdown")
 
 @dp.message(Command("cancel"))
-@admin_only
-async def admin_cancel(message: Message):
-    if ADMIN_ID in admin_states:
-        del admin_states[ADMIN_ID]
+async def cmd_cancel(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    
+    if message.from_user.id in admin_states:
+        del admin_states[message.from_user.id]
         await message.answer("❌ Действие отменено")
     else:
         await message.answer("Нет активных действий")
 
-# === ОСНОВНАЯ ЛОГИКА СОЗДАНИЯ РАССЫЛОК ===
-async def save_broadcast(message: Message, state: dict):
-    """Сохраняет рассылку в БД"""
-    broadcast_id = db.add_broadcast(
-        name=state["name"],
-        content_type=state["content_type"],
-        schedule_type=state["schedule_type"],
-        hour=state.get("hour"),
-        minute=state.get("minute"),
-        interval_minutes=state.get("interval_minutes"),
-        text=state.get("text"),
-        photo_file_id=state.get("photo_file_id"),
-        days=state.get("days")
-    )
+# === ОБРАБОТКА CALLBACK КНОПОК ===
+@dp.callback_query()
+async def handle_callback(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Нет доступа!", show_alert=True)
+        return
     
-    broadcast = db.get_broadcast(broadcast_id)
-    await add_broadcast_to_scheduler(broadcast)
+    data = callback.data
+    await callback.answer()
     
-    if state["schedule_type"] == 'fixed':
-        days_str = ", ".join(state["days"]) if state.get("days") else "ежедневно"
-        schedule_info = f"{state['hour']:02d}:{state['minute']:02d} ({days_str})"
-    else:
-        mins = state["interval_minutes"]
-        hours = mins // 60
-        minutes = mins % 60
-        if hours > 0:
-            schedule_info = f"каждые {hours}ч {minutes}мин" if minutes > 0 else f"каждые {hours}ч"
-        else:
-            schedule_info = f"каждые {minutes}мин"
+    if data == "admin_create":
+        admin_states[callback.from_user.id] = {"step": "name"}
+        await callback.message.answer("📝 Введите **название** рассылки:", parse_mode="Markdown")
     
-    await message.answer(
-        f"✅ **Рассылка создана!**\n\n"
-        f"📢 {state['name']}\n"
-        f"⏰ {schedule_info}\n\n"
-        f"Используйте /admin для управления",
-        parse_mode="Markdown"
-    )
+    elif data == "admin_list":
+        await show_broadcasts_list(callback.message)
     
-    del admin_states[ADMIN_ID]
+    elif data == "admin_stats":
+        await cmd_stats(callback.message)
+    
+    elif data == "admin_users":
+        await cmd_users(callback.message)
+    
+    elif data == "admin_all_toggle":
+        await toggle_all_broadcasts(callback.message)
+    
+    elif data.startswith("broadcast_toggle_"):
+        broadcast_id = int(data.split("_")[2])
+        b = db.get_broadcast(broadcast_id)
+        if b:
+            new_status = not b['is_active']
+            db.update_broadcast(broadcast_id, is_active=new_status)
+            job_id = f"broadcast_{broadcast_id}"
+            if new_status:
+                if b['schedule_type'] == 'fixed':
+                    scheduler.add_job(send_broadcast, CronTrigger(hour=b['hour'], minute=b['minute']), args=[broadcast_id], id=job_id)
+                elif b['schedule_type'] == 'interval' and b['interval_minutes']:
+                    scheduler.add_job(send_broadcast, IntervalTrigger(minutes=b['interval_minutes']), args=[broadcast_id], id=job_id)
+            else:
+                if scheduler.get_job(job_id):
+                    scheduler.remove_job(job_id)
+            await callback.message.answer(f"🔄 Рассылка {'включена ✅' if new_status else 'отключена ⛔'}")
+            await show_broadcasts_list(callback.message)
+    
+    elif data.startswith("broadcast_delete_"):
+        broadcast_id = int(data.split("_")[2])
+        job_id = f"broadcast_{broadcast_id}"
+        if scheduler.get_job(job_id):
+            scheduler.remove_job(job_id)
+        db.delete_broadcast(broadcast_id)
+        await callback.message.answer("🗑 Рассылка удалена")
+        await show_broadcasts_list(callback.message)
 
+async def show_broadcasts_list(message: types.Message):
+    broadcasts = db.get_all_broadcasts()
+    
+    if not broadcasts:
+        await message.answer("📭 **Нет созданных рассылок**\n\nИспользуйте /admin → Создать рассылку", parse_mode="Markdown")
+        return
+    
+    text = "📋 **Список рассылок**\n\n"
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[])
+    
+    for b in broadcasts:
+        status = "✅" if b['is_active'] else "⛔"
+        if b['schedule_type'] == 'fixed':
+            schedule = f"{b['hour']:02d}:{b['minute']:02d}"
+        else:
+            mins = b['interval_minutes']
+            hours = mins // 60
+            minutes = mins % 60
+            if hours > 0:
+                schedule = f"каждые {hours}ч {minutes}мин" if minutes > 0 else f"каждые {hours}ч"
+            else:
+                schedule = f"каждые {minutes}мин"
+        
+        text += f"{status} **{b['name']}**\n   ⏰ {schedule}\n   📝 ID: {b['id']}\n\n"
+        keyboard.inline_keyboard.append([
+            InlineKeyboardButton(text=f"{status} {b['name'][:20]}", callback_data=f"broadcast_toggle_{b['id']}"),
+            InlineKeyboardButton(text="🗑", callback_data=f"broadcast_delete_{b['id']}")
+        ])
+    
+    keyboard.inline_keyboard.append([InlineKeyboardButton(text="◀️ Назад", callback_data="admin")])
+    await message.answer(text, parse_mode="Markdown", reply_markup=keyboard)
+
+async def toggle_all_broadcasts(message: types.Message):
+    broadcasts = db.get_all_broadcasts()
+    active = [b for b in broadcasts if b['is_active']]
+    
+    if active:
+        for b in broadcasts:
+            if b['is_active']:
+                db.update_broadcast(b['id'], is_active=False)
+                if scheduler.get_job(f"broadcast_{b['id']}"):
+                    scheduler.remove_job(f"broadcast_{b['id']}")
+        await message.answer("⛔ **Все рассылки отключены**", parse_mode="Markdown")
+    else:
+        for b in broadcasts:
+            db.update_broadcast(b['id'], is_active=True)
+            job_id = f"broadcast_{b['id']}"
+            if b['schedule_type'] == 'fixed':
+                scheduler.add_job(send_broadcast, CronTrigger(hour=b['hour'], minute=b['minute']), args=[b['id']], id=job_id)
+            elif b['schedule_type'] == 'interval' and b['interval_minutes']:
+                scheduler.add_job(send_broadcast, IntervalTrigger(minutes=b['interval_minutes']), args=[b['id']], id=job_id)
+        await message.answer("✅ **Все рассылки включены**", parse_mode="Markdown")
+
+# === СОЗДАНИЕ РАССЫЛКИ (по шагам) ===
 @dp.message()
-async def handle_admin_input(message: Message):
-    if message.from_user.id != ADMIN_ID:
+async def handle_input(message: Message):
+    if not is_admin(message.from_user.id):
         return
     
-    if ADMIN_ID not in admin_states:
+    if message.from_user.id not in admin_states:
         return
     
-    state = admin_states[ADMIN_ID]
+    state = admin_states[message.from_user.id]
     step = state.get("step")
     
-    # Шаг 1: Название
-    if step == "create_name":
+    if step == "name":
         state["name"] = message.text
-        state["step"] = "create_type"
-        await message.answer(
-            "📝 **Тип контента**\n\n"
-            "Отправьте:\n"
-            "`текст` - текстовая рассылка\n"
-            "`фото` - рассылка с фото",
-            parse_mode="Markdown"
-        )
+        state["step"] = "type"
+        await message.answer("📝 **Тип контента**\n\nОтправьте `текст` или `фото`:", parse_mode="Markdown")
     
-    # Шаг 2: Тип контента
-    elif step == "create_type":
+    elif step == "type":
         if message.text.lower() in ["текст", "text"]:
             state["content_type"] = "text"
-            state["step"] = "create_text"
+            state["step"] = "text_content"
             await message.answer("📝 Отправьте **текст** рассылки:", parse_mode="Markdown")
         elif message.text.lower() in ["фото", "photo"]:
             state["content_type"] = "photo"
-            state["step"] = "create_photo"
+            state["step"] = "photo_content"
             await message.answer("🖼 Отправьте **фото** (можно с подписью):", parse_mode="Markdown")
         else:
             await message.answer("❌ Отправьте 'текст' или 'фото'")
     
-    # Шаг 3a: Текст
-    elif step == "create_text":
+    elif step == "text_content":
         state["text"] = message.text
-        state["step"] = "choose_schedule"
+        state["step"] = "schedule_type"
         await message.answer(
             "⏰ **Тип расписания**\n\n"
             "Отправьте:\n"
-            "`1` - В определённое время (например, 09:30)\n"
+            "`1` - В определённое время\n"
             "`2` - Каждый час / с интервалом",
             parse_mode="Markdown"
         )
     
-    # Шаг 3b: Фото
-    elif step == "create_photo":
+    elif step == "photo_content":
         if message.photo:
             state["photo_file_id"] = message.photo[-1].file_id
             state["text"] = message.caption or ""
-            state["step"] = "choose_schedule"
+            state["step"] = "schedule_type"
             await message.answer(
                 "⏰ **Тип расписания**\n\n"
                 "Отправьте:\n"
@@ -446,8 +503,7 @@ async def handle_admin_input(message: Message):
         else:
             await message.answer("❌ Отправьте фото")
     
-    # Шаг 4: Выбор типа расписания
-    elif step == "choose_schedule":
+    elif step == "schedule_type":
         if message.text == "1":
             state["schedule_type"] = "fixed"
             state["step"] = "fixed_time"
@@ -467,69 +523,90 @@ async def handle_admin_input(message: Message):
         else:
             await message.answer("❌ Отправьте 1 или 2")
     
-    # Шаг 5: Фиксированное время
     elif step == "fixed_time":
         try:
             hour, minute = map(int, message.text.split(':'))
             if 0 <= hour <= 23 and 0 <= minute <= 59:
                 state["hour"] = hour
                 state["minute"] = minute
-                state["step"] = "fixed_days"
+                
+                broadcast_id = db.add_broadcast(
+                    name=state["name"],
+                    content_type=state["content_type"],
+                    schedule_type="fixed",
+                    text=state.get("text"),
+                    photo_file_id=state.get("photo_file_id"),
+                    hour=hour,
+                    minute=minute
+                )
+                
+                scheduler.add_job(
+                    send_broadcast,
+                    CronTrigger(hour=hour, minute=minute),
+                    args=[broadcast_id],
+                    id=f"broadcast_{broadcast_id}"
+                )
+                
                 await message.answer(
-                    "📅 **Дни недели**\n\n"
-                    "Отправьте номера через пробел:\n"
-                    "`1 2 3 4 5` - будни\n"
-                    "`6 7` - выходные\n"
-                    "`1 3 5` - ПН, СР, ПТ\n\n"
-                    "Или отправьте `ежедневно`",
+                    f"✅ **Рассылка создана!**\n\n"
+                    f"📢 {state['name']}\n"
+                    f"⏰ {hour:02d}:{minute:02d}\n\n"
+                    f"Используйте /admin для управления",
                     parse_mode="Markdown"
                 )
+                del admin_states[message.from_user.id]
             else:
                 raise ValueError
         except:
             await message.answer("❌ Неверный формат. Пример: 09:30")
     
-    # Шаг 6: Дни для fixed
-    elif step == "fixed_days":
-        days_map = {'1': 'mon', '2': 'tue', '3': 'wed', '4': 'thu', 
-                    '5': 'fri', '6': 'sat', '7': 'sun'}
-        
-        if message.text.lower() == "ежедневно":
-            state["days"] = None
-        else:
-            day_numbers = message.text.split()
-            days = [days_map[d] for d in day_numbers if d in days_map]
-            if not days:
-                await message.answer("❌ Не выбрано ни одного дня. Попробуйте снова:")
-                return
-            state["days"] = days
-        
-        await save_broadcast(message, state)
-    
-    # Шаг 5b: Интервал
     elif step == "interval_minutes":
         try:
-            interval_minutes = int(message.text)
-            if interval_minutes <= 0:
+            interval = int(message.text)
+            if interval <= 0:
                 raise ValueError
-            state["interval_minutes"] = interval_minutes
-            await save_broadcast(message, state)
+            
+            broadcast_id = db.add_broadcast(
+                name=state["name"],
+                content_type=state["content_type"],
+                schedule_type="interval",
+                text=state.get("text"),
+                photo_file_id=state.get("photo_file_id"),
+                interval_minutes=interval
+            )
+            
+            scheduler.add_job(
+                send_broadcast,
+                IntervalTrigger(minutes=interval),
+                args=[broadcast_id],
+                id=f"broadcast_{broadcast_id}"
+            )
+            
+            hours = interval // 60
+            minutes = interval % 60
+            if hours > 0:
+                schedule_text = f"каждые {hours}ч {minutes}мин" if minutes > 0 else f"каждые {hours}ч"
+            else:
+                schedule_text = f"каждые {minutes}мин"
+            
+            await message.answer(
+                f"✅ **Рассылка создана!**\n\n"
+                f"📢 {state['name']}\n"
+                f"⏰ {schedule_text}\n\n"
+                f"Используйте /admin для управления",
+                parse_mode="Markdown"
+            )
+            del admin_states[message.from_user.id]
         except:
             await message.answer("❌ Введите положительное число (минуты)")
 
 # === ЗАПУСК ===
-async def on_startup():
-    logger.info("Бот запускается...")
-    await load_all_broadcasts()
-    logger.info(f"Бот готов! Админ ID: {ADMIN_ID}")
-
 async def main():
-    await on_startup()
+    logger.info("🚀 Бот запускается...")
+    await load_broadcasts()
     scheduler.start()
+    logger.info(f"✅ Бот готов! Админ ID: {ADMIN_ID}")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Бот остановлен")
+    asyncio.run(main())
