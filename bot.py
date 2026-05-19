@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 from datetime import datetime
+import pytz  # ← добавили для работы с часовыми поясами
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
@@ -12,7 +13,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 # Настройки из переменных окружения
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow")
+TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow")  # ← по умолчанию Москва
 
 # Проверка наличия токена
 if not BOT_TOKEN:
@@ -29,12 +30,12 @@ logger = logging.getLogger(__name__)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
-scheduler = AsyncIOScheduler(timezone=TIMEZONE)
+scheduler = AsyncIOScheduler(timezone=TIMEZONE)  # ← явно указываем часовой пояс
 
 # Временное хранилище для состояний админа
 admin_states = {}
 
-# База данных (простая версия для начала)
+# === ПРОСТАЯ БАЗА ДАННЫХ ===
 import sqlite3
 import json
 
@@ -67,7 +68,8 @@ class SimpleDB:
                 interval_minutes INTEGER,
                 days TEXT,
                 is_active INTEGER DEFAULT 1,
-                last_sent_at TIMESTAMP
+                last_sent_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
         self.conn.commit()
@@ -114,7 +116,7 @@ class SimpleDB:
     
     def get_all_broadcasts(self):
         cursor = self.conn.cursor()
-        cursor.execute('SELECT id, name, content_type, schedule_type, hour, minute, interval_minutes, days, is_active, last_sent_at FROM broadcasts')
+        cursor.execute('SELECT id, name, content_type, schedule_type, hour, minute, interval_minutes, days, is_active, last_sent_at, created_at FROM broadcasts')
         rows = cursor.fetchall()
         result = []
         for row in rows:
@@ -128,7 +130,8 @@ class SimpleDB:
                 'interval_minutes': row[6],
                 'days': json.loads(row[7]) if row[7] else None,
                 'is_active': bool(row[8]),
-                'last_sent_at': row[9]
+                'last_sent_at': row[9],
+                'created_at': row[10]
             })
         return result
     
@@ -180,7 +183,7 @@ class SimpleDB:
         self.conn.commit()
     
     def log_broadcast(self, broadcast_id, count):
-        pass  # для простоты
+        pass
 
 db = SimpleDB()
 
@@ -190,9 +193,15 @@ def is_admin(user_id):
 
 # === ОТПРАВКА РАССЫЛКИ ===
 async def send_broadcast(broadcast_id: int):
-    logger.info(f"Запуск рассылки #{broadcast_id}")
+    logger.info(f"🚀 Запуск рассылки #{broadcast_id} в {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    
     broadcast = db.get_broadcast(broadcast_id)
-    if not broadcast or not broadcast['is_active']:
+    if not broadcast:
+        logger.warning(f"Рассылка #{broadcast_id} не найдена")
+        return
+    
+    if not broadcast['is_active']:
+        logger.info(f"Рассылка #{broadcast_id} отключена")
         return
     
     users = db.get_active_users()
@@ -216,24 +225,32 @@ async def send_broadcast(broadcast_id: int):
                 db.remove_user(user_id)
     
     db.update_last_sent(broadcast_id)
-    logger.info(f"Рассылка #{broadcast_id}: {success}/{len(users)}")
+    logger.info(f"✅ Рассылка #{broadcast_id} завершена: {success}/{len(users)}")
 
 # === ЗАГРУЗКА РАССЫЛОК ===
 async def load_broadcasts():
-    for b in db.get_all_broadcasts():
-        if b['is_active']:
-            job_id = f"broadcast_{b['id']}"
-            if scheduler.get_job(job_id):
-                scheduler.remove_job(job_id)
-            
-            if b['schedule_type'] == 'fixed' and b['hour'] is not None:
-                trigger = CronTrigger(hour=b['hour'], minute=b['minute'])
-                scheduler.add_job(send_broadcast, trigger, args=[b['id']], id=job_id)
-                logger.info(f"Загружена рассылка #{b['id']}: {b['hour']:02d}:{b['minute']:02d}")
-            elif b['schedule_type'] == 'interval' and b['interval_minutes']:
-                trigger = IntervalTrigger(minutes=b['interval_minutes'])
-                scheduler.add_job(send_broadcast, trigger, args=[b['id']], id=job_id)
-                logger.info(f"Загружена рассылка #{b['id']}: каждые {b['interval_minutes']} мин")
+    broadcasts = db.get_all_broadcasts()
+    logger.info(f"Загрузка {len(broadcasts)} рассылок из БД")
+    
+    for b in broadcasts:
+        job_id = f"broadcast_{b['id']}"
+        
+        if scheduler.get_job(job_id):
+            scheduler.remove_job(job_id)
+        
+        if not b['is_active']:
+            logger.info(f"Рассылка #{b['id']} неактивна, пропускаем")
+            continue
+        
+        if b['schedule_type'] == 'fixed' and b['hour'] is not None:
+            trigger = CronTrigger(hour=b['hour'], minute=b['minute'], timezone=TIMEZONE)
+            scheduler.add_job(send_broadcast, trigger, args=[b['id']], id=job_id)
+            logger.info(f"📅 Загружена fixed-рассылка #{b['id']}: {b['name']} в {b['hour']:02d}:{b['minute']:02d} ({TIMEZONE})")
+        
+        elif b['schedule_type'] == 'interval' and b['interval_minutes']:
+            trigger = IntervalTrigger(minutes=b['interval_minutes'])
+            scheduler.add_job(send_broadcast, trigger, args=[b['id']], id=job_id)
+            logger.info(f"⏱ Загружена interval-рассылка #{b['id']}: {b['name']} каждые {b['interval_minutes']} мин")
 
 # === КОМАНДЫ ДЛЯ ВСЕХ ===
 @dp.message(Command("start"))
@@ -267,11 +284,29 @@ async def cmd_id(message: Message):
     await message.answer(f"🆔 **Ваш ID:** `{message.from_user.id}`", parse_mode="Markdown")
 
 # === КОМАНДЫ ДЛЯ АДМИНА ===
+@dp.message(Command("time"))
+async def cmd_time(message: Message):
+    """Проверка текущего времени на сервере"""
+    if not is_admin(message.from_user.id):
+        return
+    
+    tz = pytz.timezone(TIMEZONE)
+    now = datetime.now(tz)
+    now_utc = datetime.now(pytz.UTC)
+    
+    await message.answer(
+        f"🕐 **Информация о времени**\n\n"
+        f"Часовой пояс бота: `{TIMEZONE}`\n"
+        f"Текущее время: `{now.strftime('%Y-%m-%d %H:%M:%S')}`\n"
+        f"UTC время: `{now_utc.strftime('%Y-%m-%d %H:%M:%S')}`\n\n"
+        f"Рассылки отправляются по времени `{TIMEZONE}`",
+        parse_mode="Markdown"
+    )
+
 @dp.message(Command("admin"))
 async def cmd_admin(message: Message):
-    """Главная админ-панель"""
     if not is_admin(message.from_user.id):
-        await message.answer("⛔ **У вас нет доступа к этой команде!**\n\nЭта команда только для администратора бота.", parse_mode="Markdown")
+        await message.answer("⛔ **У вас нет доступа к этой команде!**", parse_mode="Markdown")
         logger.warning(f"Неавторизованный доступ к /admin от {message.from_user.id}")
         return
     
@@ -280,13 +315,15 @@ async def cmd_admin(message: Message):
         [InlineKeyboardButton(text="📋 Список рассылок", callback_data="admin_list")],
         [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
         [InlineKeyboardButton(text="👥 Подписчики", callback_data="admin_users")],
-        [InlineKeyboardButton(text="⏸ Все рассылки", callback_data="admin_all_toggle")]
+        [InlineKeyboardButton(text="⏸ Все рассылки", callback_data="admin_all_toggle")],
+        [InlineKeyboardButton(text="🕐 Проверить время", callback_data="admin_time")]
     ])
     
     await message.answer(
-        "🔧 **Панель администратора**\n\n"
+        f"🔧 **Панель администратора**\n\n"
         f"👥 Подписчиков: {db.get_user_count()}\n"
         f"📢 Рассылок: {len(db.get_all_broadcasts())}\n\n"
+        f"🕐 Часовой пояс: `{TIMEZONE}`\n\n"
         "Выберите действие:",
         reply_markup=keyboard,
         parse_mode="Markdown"
@@ -306,7 +343,8 @@ async def cmd_stats(message: Message):
         f"📊 **Статистика бота**\n\n"
         f"👥 Подписчиков: {users_count}\n"
         f"📢 Всего рассылок: {len(broadcasts)}\n"
-        f"✅ Активных: {active_count}",
+        f"✅ Активных: {active_count}\n"
+        f"🕐 Часовой пояс: `{TIMEZONE}`",
         parse_mode="Markdown"
     )
 
@@ -365,6 +403,9 @@ async def handle_callback(callback: CallbackQuery):
     elif data == "admin_users":
         await cmd_users(callback.message)
     
+    elif data == "admin_time":
+        await cmd_time(callback.message)
+    
     elif data == "admin_all_toggle":
         await toggle_all_broadcasts(callback.message)
     
@@ -377,12 +418,17 @@ async def handle_callback(callback: CallbackQuery):
             job_id = f"broadcast_{broadcast_id}"
             if new_status:
                 if b['schedule_type'] == 'fixed':
-                    scheduler.add_job(send_broadcast, CronTrigger(hour=b['hour'], minute=b['minute']), args=[broadcast_id], id=job_id)
+                    trigger = CronTrigger(hour=b['hour'], minute=b['minute'], timezone=TIMEZONE)
+                    scheduler.add_job(send_broadcast, trigger, args=[broadcast_id], id=job_id)
+                    logger.info(f"Включена fixed-рассылка #{broadcast_id}: {b['hour']:02d}:{b['minute']:02d}")
                 elif b['schedule_type'] == 'interval' and b['interval_minutes']:
-                    scheduler.add_job(send_broadcast, IntervalTrigger(minutes=b['interval_minutes']), args=[broadcast_id], id=job_id)
+                    trigger = IntervalTrigger(minutes=b['interval_minutes'])
+                    scheduler.add_job(send_broadcast, trigger, args=[broadcast_id], id=job_id)
+                    logger.info(f"Включена interval-рассылка #{broadcast_id}: каждые {b['interval_minutes']} мин")
             else:
                 if scheduler.get_job(job_id):
                     scheduler.remove_job(job_id)
+                    logger.info(f"Выключена рассылка #{broadcast_id}")
             await callback.message.answer(f"🔄 Рассылка {'включена ✅' if new_status else 'отключена ⛔'}")
             await show_broadcasts_list(callback.message)
     
@@ -418,7 +464,9 @@ async def show_broadcasts_list(message: types.Message):
             else:
                 schedule = f"каждые {minutes}мин"
         
-        text += f"{status} **{b['name']}**\n   ⏰ {schedule}\n   📝 ID: {b['id']}\n\n"
+        last_sent = f"\n   📨 Последняя: {b['last_sent_at']}" if b['last_sent_at'] else ""
+        
+        text += f"{status} **{b['name']}**\n   ⏰ {schedule}{last_sent}\n   📝 ID: {b['id']}\n\n"
         keyboard.inline_keyboard.append([
             InlineKeyboardButton(text=f"{status} {b['name'][:20]}", callback_data=f"broadcast_toggle_{b['id']}"),
             InlineKeyboardButton(text="🗑", callback_data=f"broadcast_delete_{b['id']}")
@@ -443,12 +491,14 @@ async def toggle_all_broadcasts(message: types.Message):
             db.update_broadcast(b['id'], is_active=True)
             job_id = f"broadcast_{b['id']}"
             if b['schedule_type'] == 'fixed':
-                scheduler.add_job(send_broadcast, CronTrigger(hour=b['hour'], minute=b['minute']), args=[b['id']], id=job_id)
+                trigger = CronTrigger(hour=b['hour'], minute=b['minute'], timezone=TIMEZONE)
+                scheduler.add_job(send_broadcast, trigger, args=[b['id']], id=job_id)
             elif b['schedule_type'] == 'interval' and b['interval_minutes']:
-                scheduler.add_job(send_broadcast, IntervalTrigger(minutes=b['interval_minutes']), args=[b['id']], id=job_id)
+                trigger = IntervalTrigger(minutes=b['interval_minutes'])
+                scheduler.add_job(send_broadcast, trigger, args=[b['id']], id=job_id)
         await message.answer("✅ **Все рассылки включены**", parse_mode="Markdown")
 
-# === СОЗДАНИЕ РАССЫЛКИ (по шагам) ===
+# === СОЗДАНИЕ РАССЫЛКИ ===
 @dp.message()
 async def handle_input(message: Message):
     if not is_admin(message.from_user.id):
@@ -540,9 +590,10 @@ async def handle_input(message: Message):
                     minute=minute
                 )
                 
+                trigger = CronTrigger(hour=hour, minute=minute, timezone=TIMEZONE)
                 scheduler.add_job(
                     send_broadcast,
-                    CronTrigger(hour=hour, minute=minute),
+                    trigger,
                     args=[broadcast_id],
                     id=f"broadcast_{broadcast_id}"
                 )
@@ -550,7 +601,7 @@ async def handle_input(message: Message):
                 await message.answer(
                     f"✅ **Рассылка создана!**\n\n"
                     f"📢 {state['name']}\n"
-                    f"⏰ {hour:02d}:{minute:02d}\n\n"
+                    f"⏰ {hour:02d}:{minute:02d} ({TIMEZONE})\n\n"
                     f"Используйте /admin для управления",
                     parse_mode="Markdown"
                 )
@@ -602,7 +653,7 @@ async def handle_input(message: Message):
 
 # === ЗАПУСК ===
 async def main():
-    logger.info("🚀 Бот запускается...")
+    logger.info(f"🚀 Бот запускается... Часовой пояс: {TIMEZONE}")
     await load_broadcasts()
     scheduler.start()
     logger.info(f"✅ Бот готов! Админ ID: {ADMIN_ID}")
