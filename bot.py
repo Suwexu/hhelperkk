@@ -45,7 +45,11 @@ import json
 
 class Database:
     def __init__(self):
-        self.conn = sqlite3.connect('bot_database.db', check_same_thread=False)
+        db_path = os.getenv("DATABASE_PATH", "bot_database.db")
+        db_dir = os.path.dirname(db_path)
+        if db_dir:
+            os.makedirs(db_dir, exist_ok=True)
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.init_tables()
     
     def init_tables(self):
